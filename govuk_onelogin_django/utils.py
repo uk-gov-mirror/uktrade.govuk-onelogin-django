@@ -2,17 +2,18 @@ import base64
 import json
 import logging
 from importlib import import_module
-from typing import Any
+from typing import Any, Self
 
 import requests
 from authlib.integrations.requests_client import OAuth2Session
-from authlib.jose import jwt
+from authlib.jose import jwt as authlib_jwt
 from authlib.oauth2.rfc7523 import PrivateKeyJWT
 from authlib.oidc.core import IDToken
 from django.conf import settings
 from django.core.cache import cache
 from django.http import QueryDict
 from django.urls import reverse
+from joserfc import jwt
 
 from . import types
 
@@ -125,15 +126,133 @@ def get_token(request: types.DjangoHttpRequest, auth_code: str) -> dict:
     return token
 
 
+class IDTokenJWTClaimsRegistry(jwt.JWTClaimsRegistry):
+    """Subclass of JWTClaimsRegistry to check extra claims.
+
+    Keys checked by jwt.JWTClaimsRegistry:
+      - iss
+      - sub
+      - aud
+      - exp
+      - nbf
+      - iat
+    Extra keys we could check:
+      - at_hash
+      - vot
+      - vtm
+      - sid
+      - auth_time
+    """
+
+    # example_values = {
+    #     "at_hash": "ZDevf74CkYWNPa8qmflQyA",
+    #     "vot": "Cl.Cm",
+    #     "vtm": "https://oidc.integration.account.gov.uk/trustmark",
+    #     "sid": "dX5xv0XgHh6yfD1xy-ss_1EDK0I",
+    #     "auth_time": 1704894300,
+    #     "sub": "urn:fdc:gov.uk:2022:VtcZjnU4Sif2oyJZola3OkN0e3Jeku1cIMN38rFlhU4",  # checked
+    #     "aud": "{YOUR_CLIENT_ID}",  # checked
+    #     "iss": "https://oidc.integration.account.gov.uk/",  # checked
+    #     "exp": 1704894526,  # checked
+    #     "iat": 1704894406,  # checked
+    #     "nonce": "lZk16Vmu8-h7r8L8bFFiHJxpC3L73UBpfb68WC1Qoqg",  # checked
+    # }
+
+    @classmethod
+    def from_config(
+        cls,
+        iss_value: str,
+        aud_value: str,
+        nonce_value: str,
+    ) -> Self:
+        claim_options: dict[str, jwt.ClaimsOption] = {
+            "iss": jwt.ClaimsOption(essential=True, value=iss_value),
+            "aud": jwt.ClaimsOption(essential=True, value=aud_value),
+            "nonce": jwt.ClaimsOption(essential=True, value=nonce_value),
+        }
+        return cls(**claim_options)
+
+    def validate_at_hash(self, value: str) -> None:
+        """OPTIONAL. Access Token hash value. Its value is the base64url
+        encoding of the left-most half of the hash of the octets of the ASCII
+        representation of the access_token value, where the hash algorithm
+        used is the hash algorithm used in the alg Header Parameter of the
+        ID Token's JOSE Header. For instance, if the alg is RS256, hash the
+        access_token value with SHA-256, then take the left-most 128 bits and
+        base64url encode them. The at_hash value is a case sensitive string.
+        """
+        # TODO: Check if we can rely on these imports
+        # from joserfc.errors import InvalidClaimError
+        # import hmac
+        # from authlib.common.encoding import to_bytes
+        # from authlib.oidc.core.util import create_half_hash
+        #
+        #
+        # def _verify_hash(signature, s, alg):
+        #     hash_value = create_half_hash(s, alg)
+        #     if hash_value is None:
+        #         return False
+        #     return hmac.compare_digest(hash_value, to_bytes(signature))
+        #
+        # access_token = self.params.get("access_token")
+        # access_token = "asdf"
+        # at_hash = self.get("at_hash")
+        # if at_hash and access_token:
+        #     # TODO: get the algorithm / token
+        #     if not _verify_hash(at_hash, access_token, self.header["alg"]):
+        #         raise InvalidClaimError("at_hash")
+        return
+
+    def validate_auth_time(self, value: str) -> None:
+        # """Time when the End-User authentication occurred. Its value is a JSON
+        # number representing the number of seconds from 1970-01-01T0:0:0Z as
+        # measured in UTC until the date/time. When a max_age request is made or
+        # when auth_time is requested as an Essential Claim, then this Claim is
+        # REQUIRED; otherwise, its inclusion is OPTIONAL.
+        # """
+        # auth_time = self.get("auth_time")
+        # if self.params.get("max_age") and not auth_time:
+        #     raise MissingClaimError("auth_time")
+        #
+        # if auth_time and not isinstance(auth_time, (int, float)):
+        #     raise InvalidClaimError("auth_time")
+
+        return None
+
+    def validate_sid(self, value: str) -> None:
+        # 	sid stands for ‘session identifier’. This uniquely identifies the user’s journey within GOV.UK One Login.
+        return None
+
+    def validate_vot(self, value: str) -> None:
+        # vot stands for ‘Vector of Trust’.
+        return None
+
+    def validate_vtm(self, value: str) -> None:
+        # 	vtm stands for ‘vector trust mark’.
+        # 	This is an HTTPS URL which lists the range of values GOV.UK One Login accepts and provides.
+        return None
+
+
 def validate_token(request: types.DjangoHttpRequest, token: dict[str, Any]) -> None:
+    print("Incoming token:")
+    print(token)
+
     config = get_oidc_config()
     stored_nonce = get_oauth_nonce(request)
 
     # id_token contents:
     # https://docs.sign-in.service.gov.uk/integrate-with-integration-environment/authenticate-your-user/#understand-your-id-token
-    claims = jwt.decode(
-        token["id_token"],
-        config.get_public_keys(),
+    signed_jwt = token["id_token"]  # The JWT to decode
+    key = config.get_public_keys()
+    print("Signing key:")
+    print(key)
+
+    #
+    # Old way to validate ID token
+    #
+    claims = authlib_jwt.decode(
+        signed_jwt,
+        key,
         claims_cls=IDToken,
         claims_options={
             "iss": {"essential": True, "value": config.issuer},
@@ -142,6 +261,21 @@ def validate_token(request: types.DjangoHttpRequest, token: dict[str, Any]) -> N
         claims_params={"nonce": stored_nonce},
     )
     claims.validate()
+
+    #
+    # New way to validate ID token
+    #
+    decoded_token = jwt.decode(signed_jwt, key)
+    print("TOKEN STUFF:")
+    print(decoded_token.header)
+    print(decoded_token.claims)
+
+    claims_requests = IDTokenJWTClaimsRegistry.from_config(
+        iss_value=config.issuer,
+        aud_value=get_client_id(request),
+        nonce_value=stored_nonce,
+    )
+    claims_requests.validate(decoded_token.claims)
 
 
 def get_userinfo(client: OAuth2Session) -> types.UserInfo:
